@@ -1,0 +1,19 @@
+.DS_Store
+  
+# Configuration
+config.py
+
+# Environment
+venv/
+__pycache__/
+*.pyc
+
+# Outputs
+extracted_images/
+*.bak.*
+*.csv
+*.log
+*.mp4
+*.MP4
+notes.txt
+youtube_chapters.txt

@@ -1,0 +1,6 @@
+certifi
+google-genai
+opencv-python
+pillow
+tenacity
+tqdm
