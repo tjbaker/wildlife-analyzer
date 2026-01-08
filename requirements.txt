@@ -1,5 +1,6 @@
 certifi
 google-genai
+google-api-core
 opencv-python
 pillow
 tenacity

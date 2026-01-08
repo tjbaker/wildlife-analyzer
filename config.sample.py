@@ -124,6 +124,10 @@ SMART_RETRY = True
 # If AI confidence is below this, we try again.
 RETRY_CONFIDENCE_THRESHOLD = 0.85
 
+# Inanimate Filter
+# The AI will ignore objects with these names.
+INANIMATE_OBJECTS = ["none", "null", "unknown", "rock", "sand", "gravel", "water", "coral rubble"]
+
 # ANALYSIS PROMPT
 # The instructions sent to Gemini.
 # You can use {location} and {date} as placeholders.
