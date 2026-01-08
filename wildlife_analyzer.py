@@ -49,7 +49,7 @@ class CONFIG:
     VIDEO_PATH = "wildlife_video.mp4"
     SNAPSHOT_INTERVAL = 1  # Seconds between checks
     BLUR_THRESHOLD = 100.0  # Variance of Laplacian. < 100 = blurry
-    MODEL_NAME = "gemini-3.0-flash"
+    MODEL_NAME = "gemini-2.0-flash"
 
     # Directory Structure
     BASE_DIR = "extracted_images"

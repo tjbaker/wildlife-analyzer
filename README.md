@@ -11,7 +11,7 @@ Built with **Python**, **OpenCV**, and **Google Gemini 2.0 Flash**.
 - **AI Identification**: Uses Google's Gemini 2.0 Vision model to identify species with high accuracy.
 - **Smart Retry**: If the AI is unsure (<85% confidence), the system automatically re-scans the video source for a clearer angle and retries.
 - **Inanimate Filtering**: Automatically ignores rocks, sand, and water to keep your logs clean.
-- **Master Log Archiving**: Consolidate sessions into a single `master_dive_log.csv` with location and date metadata.
+- **Master Log Archiving**: Consolidate sessions into a single `master_sighting_log.csv` with location and date metadata.
 - **YouTube Chapters**: Generates improved timestamps and species names ready for video descriptions.
 
 ## Usage
@@ -90,7 +90,7 @@ python wildlife_analyzer.py archive
 | :--- | :--- | :--- |
 | `VIDEO_PATH` | Path to your source video file. | `"wildlife_video.mp4"` |
 | `LOCATION_CONTEXT` | Helps AI identify region-specific species. | `"Backyard, New England"` |
-| `MODEL_NAME` | The Gemini model to use. | `"gemini-3.0-flash"` |
+| `MODEL_NAME` | The Gemini model to use. | `"gemini-2.0-flash"` |
 | `API_DELAY` | Seconds to wait between API calls (prevents 429 errors). | `2.0` |
 | `LOG_LEVEL` | Controls output verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`). | `"INFO"` |
 | `SMART_EXTRACT` | If `true`, scans the full second to find the sharpest frame (slower but better). | `false` |
