@@ -45,28 +45,34 @@ BASE_DIR = "extracted_images"
 # E.g., "Backyard, New England", "Serengeti", "Amazon Rainforest".
 LOCATION_CONTEXT = "St. Lucia, Caribbean"
 
-# GOOGLE GEMINI API KEY
-# Required for the 'analyze' step.
-# You can get a free key at: https://aistudio.google.com/app/apikey
-GOOGLE_API_KEY = "YOUR_API_KEY_HERE"
+# AI PROVIDER
+#   "gemini"     — Google Gemini (default)
+#   "anthropic"  — Anthropic Claude
+PROVIDER = "gemini"
 
-# GEMINI MODEL NAME
-# The model to use for analysis.
-# Options:
-#   - "gemini-2.0-flash" (Fast, low cost)
-#   - "gemini-2.0-pro"   (Higher reasoning)
-#   - "gemini-3-flash-preview" (Newest, experimental)
-# Default: "gemini-2.0-flash"
+# API KEYS — set the one matching your provider
+GOOGLE_API_KEY = "YOUR_API_KEY_HERE"
+ANTHROPIC_API_KEY = "YOUR_API_KEY_HERE"
+
+# MODEL NAME — must match the selected provider
+#   Gemini:     "gemini-2.0-flash" (fast/cheap) | "gemini-2.5-flash" (more accurate)
+#   Anthropic:  "claude-haiku-4-5" (fast/cheap) | "claude-sonnet-4-6" (more accurate)
 MODEL_NAME = "gemini-2.0-flash"
 
-# API RATE LIMITING
-# Delay in seconds between API calls to avoid hitting rate limits (429).
-# Increase this if you see frequent "RESOURCE_EXHAUSTED" errors.
+# SESSION TAG — optional suffix appended to the log filename (e.g. "_test", "_anthropic")
+# Useful for side-by-side comparisons without overwriting existing logs.
+SESSION_TAG = ""
+
+# API RATE LIMITING — increase if you see 429 / RESOURCE_EXHAUSTED errors
 API_DELAY = 2.0
 
-# LOG LEVEL
-# Controls verbosity of the output.
-# Options: "DEBUG", "INFO", "WARNING", "ERROR"
+# PARALLEL WORKERS — 1 = safe for free tier (15 RPM); 5 = paid tier
+MAX_WORKERS = 1
+
+# CONTEXT FRAMES — frames sent per Gemini call; 3 = temporal context, 1 = faster
+CONTEXT_FRAMES = 3
+
+# LOG LEVEL — DEBUG for verbose output, INFO for normal
 LOG_LEVEL = "INFO"
 
 
@@ -74,69 +80,48 @@ LOG_LEVEL = "INFO"
 # 2. EXTRACTION SETTINGS (Finding the images)
 # ==============================================================================
 
-# SNAPSHOT INTERVAL (Seconds)
-# How often to grab a frame from the video.
-#   1 = Check every second (High detail, more images)
-#   5 = Check every 5 seconds (Faster, fewer images)
+# How often to grab a frame from the video (seconds)
 SNAPSHOT_INTERVAL = 1
 
-# SMART EXTRACT (High Quality Mode)
-#   False (Default): Grabs exactly one frame at the interval. Fast.
-#   True           : Scans the *entire* second around the interval to find
-#                    the absolutely sharpest frame. Slower, but better quality.
-SMART_EXTRACT = False
+# SMART EXTRACT — scan full second for sharpest frame (True = better quality, slower)
+SMART_EXTRACT = True
 
-# BLUR THRESHOLD (Auto-Tuned)
-# A measure of image sharpness (Laplacian Variance).
-#   Higher = Stricter (requires sharper images).
-#   Lower  = Lenient (allows more blur).
-# Run 'python wildlife_analyzer.py tune' to set this automatically.
+# BLUR / CONTENT THRESHOLDS — auto-tuned by `tune` mode; rarely set manually
 BLUR_THRESHOLD = 100.0
-
-# MIN CONTENT THRESHOLD (Auto-Tuned)
-# A measure of 'stuff' in the image (Edge Density).
-#   Higher = Stricter (requires complex scenes/animals).
-#   Lower  = Lenient (allows empty blue water).
-# Run 'python wildlife_analyzer.py tune' to set this automatically.
 MIN_CONTENT_THRESHOLD = 0.005
-MOTION_THRESHOLD = 0.10 # 10% of pixels must change (Ignores minor shake)
+MOTION_THRESHOLD = 0.10
 
 
 # ==============================================================================
-# 3. ANALYSIS SETTINGS (Identifying the fish)
+# 3. ANALYSIS SETTINGS (Identifying species)
 # ==============================================================================
 
-# CONFIDENCE THRESHOLD
-# How sure the AI must be to log a species in the 'YouTube Chapters' file.
-#   0.70 = 70% Confidence.
-# Range: 0.0 to 1.0.
+# Minimum confidence to appear in youtube_chapters.txt (0.0–1.0)
 CONFIDENCE_THRESHOLD = 0.70
 
-# SMART RETRY (AI Double-Check)
-# If True, when the AI is unsure (confidence < RETRY_CONFIDENCE_THRESHOLD),
-# the script will pause, look at the video again to find a slightly different
-# angle or sharper frame from that same moment, and ask the AI again.
-# Significantly improves results for tricky shots.
+# SMART RETRY — re-query with a sharper frame when confidence is low or scientific name unknown
 SMART_RETRY = True
-
-# RETRY THRESHOLD
-# The confidence level that triggers a Smart Retry.
-# If AI confidence is below this, we try again.
-RETRY_CONFIDENCE_THRESHOLD = 0.85
+RETRY_CONFIDENCE_THRESHOLD = 0.60
 
 # Inanimate Filter
 # The AI will ignore objects with these names.
-INANIMATE_OBJECTS = ["none", "null", "unknown", "rock", "sand", "gravel", "water", "coral rubble"]
+INANIMATE_OBJECTS = ["none", "null", "unknown", "rock", "sand", "gravel", "water", "coral rubble",
+                     "reef fish", "fish", "marine fish", "tropical fish", "saltwater fish",
+                     "human", "person", "snorkeler", "diver"]
 
 # ANALYSIS PROMPT
 # The instructions sent to Gemini.
-# You can use {location} and {date} as placeholders.
+# Placeholders: {location}, {date}, {n} (number of context frames).
 ANALYSIS_PROMPT = (
-    "You are a Marine Biologist. Location: {location}. {date} "
-    "Identify the marine animal species in this image. "
-    "Consider the location and date (seasonality) to identify species present in this region at this time. "
-    "Only identify animals that are CLEARLY VISIBLE. Do not guess based on shadows, shapes, or blurry blobs. "
-    "If the image contains only background (rocks, sand, water, coral rubble) or ambiguous shapes, return null for names. "
-    "Return valid JSON only: "
-    "{{'common_name': 'Common Name' or null, 'scientific_name': 'Scientific Name' or null, 'confidence': 0.0-1.0}}."
+    "You are a field biologist. Location: {location}. {date}"
+    "Examine these {n} sequential video frames from the same moment. "
+    "Identify ALL distinct living creatures that are CLEARLY VISIBLE across the frames. "
+    "Only identify species plausible for this location and environment — "
+    "never identify a freshwater species in ocean footage, or a terrestrial species underwater. "
+    "When uncertain between two species, use location to break the tie. "
+    "Do not guess based on shadows, blur, or ambiguous shapes. "
+    "Return ONLY valid JSON with no markdown — an array of objects, one per species. "
+    "Return an empty array [] if only background is visible (water, rocks, sand, coral, foliage). "
+    '[{{"common_name": "string", "scientific_name": "string", '
+    '"confidence": 0.0-1.0, "notes": "brief observation"}}]'
 )

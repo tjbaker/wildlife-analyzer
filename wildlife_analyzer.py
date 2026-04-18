@@ -20,25 +20,37 @@ import sys
 import glob
 import json
 import time
-import math
-import math
 import datetime
 import argparse
 import certifi
 import shutil
+import threading
+import base64
+import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import groupby
 from tqdm import tqdm
 from google import genai
 from google.genai import types
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    retry_if_exception,
+)
 from google.api_core import exceptions
 import ast
-import ast
-# import shutil # REMOVED: Duplicate
 import re
 import PIL.Image
 import csv
 import subprocess
 import logging
+
+try:
+    import anthropic as _anthropic
+except ImportError:
+    _anthropic = None
 
 # Fix SSL on Mac
 os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -64,11 +76,11 @@ class CONFIG:
     MIN_CONTENT_THRESHOLD = 0.005
     MOTION_THRESHOLD = 0.10  # Reduced sensitivity. 10% change required.
     COST_PER_IMAGE = 0.0001
-    SMART_EXTRACT = False
+    SMART_EXTRACT = True
 
     # Smart Retry Config
     SMART_RETRY = True
-    RETRY_CONFIDENCE_THRESHOLD = 0.85
+    RETRY_CONFIDENCE_THRESHOLD = 0.60
 
     # Inanimate Filter
     INANIMATE_OBJECTS = [
@@ -79,36 +91,63 @@ class CONFIG:
         "sand",
         "gravel",
         "water",
-        "coral rubble"]
+        "coral rubble",
+        "reef fish",
+        "fish",
+        "marine fish",
+        "tropical fish",
+        "saltwater fish",
+        "human",
+        "person",
+        "snorkeler",
+        "diver",
+    ]
+
+    API_DELAY = 2.0
+    LOG_LEVEL = "INFO"
+    MAX_WORKERS = 1
+    CONTEXT_FRAMES = 3
+
+    # Provider
+    PROVIDER = "gemini"  # "gemini" or "anthropic"
+    ANTHROPIC_API_KEY = ""
+    SESSION_TAG = ""  # appended to log filename, e.g. "_anthropic_test"
 
     # Default Prompt
     ANALYSIS_PROMPT = (
-        "You are a Wildlife Expert. Location: {location}. {date} "
-        "Identify the animal species in this image. "
-        "Consider the location and date (seasonality) to identify species present in this region at this time. "
-        "If the image contains only background (rocks, sand, water, foliage) and no distinct animal, return null for names. "
-        "Return valid JSON only: "
-        "{{'common_name': 'Common Name' or null, 'scientific_name': 'Scientific Name' or null, 'confidence': 0.0-1.0}}.")
+        "You are a field biologist. Location: {location}. {date}"
+        "Examine these {n} sequential video frames from the same moment. "
+        "Identify ALL distinct living creatures that are CLEARLY VISIBLE across the frames. "
+        "Only identify species plausible for this location and environment — "
+        "never identify a freshwater species in ocean footage, or a terrestrial species underwater. "
+        "When uncertain between two species, use location to break the tie. "
+        "Do not guess based on shadows, blur, or ambiguous shapes. "
+        "Return ONLY valid JSON with no markdown — an array of objects, one per species. "
+        "Return an empty array [] if only background is visible (water, rocks, sand, coral, foliage). "
+        '[{{"common_name": "string", "scientific_name": "string", '
+        '"confidence": 0.0-1.0, "notes": "brief observation"}}]'
+    )
 
     @classmethod
     def load(cls):
-        # Try importing config.py
         try:
             import sys
-            # Ensure current directory is in path
+            import importlib
+
             if os.getcwd() not in sys.path:
                 sys.path.append(os.getcwd())
 
-            import config as user_config
-            import importlib
-            # Reload in case of changes during runtime
+            config_name = os.environ.get("WILDLIFE_CONFIG", "config")
+            user_config = importlib.import_module(config_name)
             importlib.reload(user_config)
 
             cls.VIDEO_PATH = getattr(user_config, "VIDEO_PATH", cls.VIDEO_PATH)
             cls.SNAPSHOT_INTERVAL = getattr(
-                user_config, "SNAPSHOT_INTERVAL", cls.SNAPSHOT_INTERVAL)
+                user_config, "SNAPSHOT_INTERVAL", cls.SNAPSHOT_INTERVAL
+            )
             cls.BLUR_THRESHOLD = getattr(
-                user_config, "BLUR_THRESHOLD", cls.BLUR_THRESHOLD)
+                user_config, "BLUR_THRESHOLD", cls.BLUR_THRESHOLD
+            )
 
             # Load Base Dir and update paths
             cls.BASE_DIR = getattr(user_config, "BASE_DIR", cls.BASE_DIR)
@@ -118,49 +157,66 @@ class CONFIG:
             cls.MANUAL_DIR = os.path.join(cls.BASE_DIR, "manual")
 
             cls.LOCATION_CONTEXT = getattr(
-                user_config, "LOCATION_CONTEXT", cls.LOCATION_CONTEXT)
+                user_config, "LOCATION_CONTEXT", cls.LOCATION_CONTEXT
+            )
             cls.CONFIDENCE_THRESHOLD = getattr(
-                user_config, "CONFIDENCE_THRESHOLD", cls.CONFIDENCE_THRESHOLD)
+                user_config, "CONFIDENCE_THRESHOLD", cls.CONFIDENCE_THRESHOLD
+            )
             cls.MIN_CONTENT_THRESHOLD = getattr(
-                user_config, "MIN_CONTENT_THRESHOLD", cls.MIN_CONTENT_THRESHOLD)
+                user_config, "MIN_CONTENT_THRESHOLD", cls.MIN_CONTENT_THRESHOLD
+            )
             cls.MOTION_THRESHOLD = getattr(
-                user_config, "MOTION_THRESHOLD", cls.MOTION_THRESHOLD)
-            cls.SMART_EXTRACT = getattr(
-                user_config, "SMART_EXTRACT", cls.SMART_EXTRACT)
+                user_config, "MOTION_THRESHOLD", cls.MOTION_THRESHOLD
+            )
+            cls.SMART_EXTRACT = getattr(user_config, "SMART_EXTRACT", cls.SMART_EXTRACT)
 
-            cls.SMART_RETRY = getattr(
-                user_config, "SMART_RETRY", cls.SMART_RETRY)
+            cls.SMART_RETRY = getattr(user_config, "SMART_RETRY", cls.SMART_RETRY)
             cls.RETRY_CONFIDENCE_THRESHOLD = getattr(
-                user_config, "RETRY_CONFIDENCE_THRESHOLD", cls.RETRY_CONFIDENCE_THRESHOLD)
+                user_config,
+                "RETRY_CONFIDENCE_THRESHOLD",
+                cls.RETRY_CONFIDENCE_THRESHOLD,
+            )
             cls.INANIMATE_OBJECTS = getattr(
-                user_config, "INANIMATE_OBJECTS", cls.INANIMATE_OBJECTS)
+                user_config, "INANIMATE_OBJECTS", cls.INANIMATE_OBJECTS
+            )
             cls.ANALYSIS_PROMPT = getattr(
-                user_config, "ANALYSIS_PROMPT", cls.ANALYSIS_PROMPT)
-            cls.MODEL_NAME = getattr(
-                user_config, "MODEL_NAME", "gemini-2.0-flash")
-            cls.API_DELAY = getattr(user_config, "API_DELAY", 2.0)
-            cls.LOG_LEVEL = getattr(user_config, "LOG_LEVEL", "INFO")
+                user_config, "ANALYSIS_PROMPT", cls.ANALYSIS_PROMPT
+            )
+            cls.MODEL_NAME = getattr(user_config, "MODEL_NAME", "gemini-2.0-flash")
+            cls.API_DELAY = getattr(user_config, "API_DELAY", cls.API_DELAY)
+            cls.LOG_LEVEL = getattr(user_config, "LOG_LEVEL", cls.LOG_LEVEL)
+            cls.MAX_WORKERS = getattr(user_config, "MAX_WORKERS", cls.MAX_WORKERS)
+            cls.CONTEXT_FRAMES = getattr(
+                user_config, "CONTEXT_FRAMES", cls.CONTEXT_FRAMES
+            )
+            cls.PROVIDER = getattr(user_config, "PROVIDER", cls.PROVIDER).lower()
+            cls.ANTHROPIC_API_KEY = getattr(
+                user_config, "ANTHROPIC_API_KEY", cls.ANTHROPIC_API_KEY
+            )
+            cls.SESSION_TAG = getattr(user_config, "SESSION_TAG", cls.SESSION_TAG)
 
-            # Load API Key if present
+            # Load API keys if present
             api_key = getattr(user_config, "GOOGLE_API_KEY", None)
             if api_key and api_key != "YOUR_API_KEY_HERE":
                 os.environ["GOOGLE_API_KEY"] = api_key
+            anthropic_key = getattr(user_config, "ANTHROPIC_API_KEY", None)
+            if anthropic_key and anthropic_key != "YOUR_API_KEY_HERE":
+                os.environ["ANTHROPIC_API_KEY"] = anthropic_key
 
             # Configure Logging
-            numeric_level = getattr(
-                logging, cls.LOG_LEVEL.upper(), logging.INFO)
+            numeric_level = getattr(logging, cls.LOG_LEVEL.upper(), logging.INFO)
             logging.basicConfig(
                 level=numeric_level,
-                format='%(asctime)s - %(levelname)s - %(message)s',
-                datefmt='%H:%M:%S'
+                format="%(asctime)s - %(levelname)s - %(message)s",
+                datefmt="%H:%M:%S",
             )
 
         except ImportError:
             # Configure Logging with defaults if config not found
             logging.basicConfig(
                 level=logging.INFO,
-                format='%(asctime)s - %(levelname)s - %(message)s',
-                datefmt='%H:%M:%S'
+                format="%(asctime)s - %(levelname)s - %(message)s",
+                datefmt="%H:%M:%S",
             )
             logging.warning("config.py not found. Using defaults.")
 
@@ -169,29 +225,34 @@ class CONFIG:
 CONFIG.load()
 
 
+class _RateLimiter:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self):
+        with self._lock:
+            gap = CONFIG.API_DELAY - (time.time() - self._last)
+            if gap > 0:
+                time.sleep(gap)
+            self._last = time.time()
+
+
+_api_rate_limiter = _RateLimiter()
+
+
 def get_session_log_path():
-    """
-    Returns the video-specific log filename, e.g. 'sighting_log_GX010070.csv'.
-    """
+    """Returns the session log filename, e.g. 'sighting_log_GX010070.csv'. SESSION_TAG is appended when set."""
     if not CONFIG.VIDEO_PATH:
-        return "sighting_log.csv"
+        return f"sighting_log{CONFIG.SESSION_TAG}.csv"
     base = os.path.basename(CONFIG.VIDEO_PATH)
     name, _ = os.path.splitext(base)
-    # Sanitize name just in case
-    name = "".join([c for c in name if c.isalnum() or c in ('-', '_')])
-    return f"sighting_log_{name}.csv"
+    name = "".join([c for c in name if c.isalnum() or c in ("-", "_")])
+    return f"sighting_log_{name}{CONFIG.SESSION_TAG}.csv"
 
 
-def find_best_frame_at_timestamp(
-        video_path,
-        timestamp_str,
-        scan_duration_sec=1.0):
-    """
-    Helper: Given a timestamp string (e.g. "00:05"),
-    opens the video, goes to that second, scans for 'scan_duration_sec'
-    returns the sharpest frame (highest blur score) found.
-    Returns (frame, score) or (None, -1).
-    """
+def find_best_frame_at_timestamp(video_path, timestamp_str, scan_duration_sec=1.0):
+    """Returns (frame, blur_score) for the sharpest frame within scan_duration_sec of timestamp_str, or (None, -1)."""
     try:
         if ":" not in timestamp_str:
             return None, -1
@@ -200,7 +261,7 @@ def find_best_frame_at_timestamp(
         minutes = int(parts[0])
         seconds = int(parts[1])
         target_time_sec = minutes * 60 + seconds
-    except BaseException:
+    except Exception:
         return None, -1
 
     cap = cv2.VideoCapture(video_path)
@@ -237,19 +298,14 @@ def find_best_frame_at_timestamp(
 
 
 def is_blurry(image):
-    """
-    Returns (True, variance) if the image is considered blurry based on the Laplacian variance.
-    """
+    """Returns (is_blurry, laplacian_variance)."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     variance = cv2.Laplacian(gray, cv2.CV_64F).var()
     return variance < CONFIG.BLUR_THRESHOLD, variance
 
 
 def has_content(image):
-    """
-    Returns (True, ratio) if the image has enough edge content to likely contain an object.
-    Uses Canny edge detection.
-    """
+    """Returns (has_content, edge_density_ratio) using Canny edge detection."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 100, 200)
 
@@ -262,10 +318,7 @@ def has_content(image):
 
 
 def detect_motion(frame1, frame2):
-    """
-    Returns (True, ratio) if significant INDEPENDENT motion is detected.
-    Uses Optical Flow to stabilize background (compensate for camera motion).
-    """
+    """Returns (motion_detected, ratio) using optical flow with affine stabilization to isolate subject motion from camera shake."""
     if frame1 is None or frame2 is None:
         return False, 0.0
 
@@ -275,11 +328,8 @@ def detect_motion(frame1, frame2):
     # 1. Find features to track in previous frame
     # We look for corners/contrast (rocks, coral, debris)
     p0 = cv2.goodFeaturesToTrack(
-        gray1,
-        maxCorners=200,
-        qualityLevel=0.01,
-        minDistance=30,
-        blockSize=3)
+        gray1, maxCorners=200, qualityLevel=0.01, minDistance=30, blockSize=3
+    )
 
     if p0 is None or len(p0) < 8:
         # Not enough background features (blue water?) -> fall back to simple diff
@@ -341,10 +391,7 @@ def detect_motion(frame1, frame2):
 
 
 def get_timestamp_from_filename(filename):
-    """
-    Parses 'frame_00m_05s.jpg' into '00:05'.
-    Also handles scored filenames like 'frame_00m_05s_blur20.jpg'
-    """
+    """Parses 'frame_00m_05s[_suffix].jpg' → '00:05'."""
     basename = os.path.basename(filename)
     # Expected format: frame_MMm_SSs...jpg
     try:
@@ -360,23 +407,21 @@ def get_timestamp_from_filename(filename):
 
 
 def ensure_directories(clear=False):
-    """
-    Ensures all output directories exist.
-    If clear=True, empties them (except MANUAL_DIR).
-    """
+    """Creates output directories. If clear=True, empties good/blurry/rejected but never manual/."""
     for directory in [
-            CONFIG.FRAMES_DIR,
-            CONFIG.REJECTED_DIR,
-            CONFIG.BLURRY_DIR,
-            CONFIG.MANUAL_DIR]:
+        CONFIG.FRAMES_DIR,
+        CONFIG.REJECTED_DIR,
+        CONFIG.BLURRY_DIR,
+        CONFIG.MANUAL_DIR,
+    ]:
         if not os.path.exists(directory):
             os.makedirs(directory)
             logging.debug(f"Created directory: {directory}")
-        elif clear:
-            # Clear all passed folders if explicit clear requested
+
+    if clear:
+        for directory in [CONFIG.FRAMES_DIR, CONFIG.REJECTED_DIR, CONFIG.BLURRY_DIR]:
             logging.info(f"Clearing existing frames in: {directory}")
-            files = glob.glob(os.path.join(directory, "*"))
-            for f in files:
+            for f in glob.glob(os.path.join(directory, "*")):
                 try:
                     os.remove(f)
                 except Exception as e:
@@ -384,11 +429,8 @@ def ensure_directories(clear=False):
 
 
 def reclassify_frames():
-    """
-    Re-scans existing images in good/blurry/rejected and moves them
-    based on current CONFIG thresholds. Faster than re-extracting.
-    """
-    logging.info(f"--- Re-sorting Existing Images ---")
+    """Re-sorts existing images across good/blurry/rejected using current thresholds. Faster than re-extracting."""
+    logging.info("--- Re-sorting Existing Images ---")
     logging.info(f"Blur Threshold: {CONFIG.BLUR_THRESHOLD}")
     logging.info(f"Content Threshold: {CONFIG.MIN_CONTENT_THRESHOLD}")
 
@@ -460,8 +502,7 @@ def reclassify_frames():
         clean_name = basename
         match = suffix_pattern.search(clean_name)
         if match:
-            clean_name = clean_name[:match.start()] + \
-                match.group(2)  # Keep extension
+            clean_name = clean_name[: match.start()] + match.group(2)  # Keep extension
 
         # Insert new suffix before extension
         name_root, ext = os.path.splitext(clean_name)
@@ -480,10 +521,8 @@ def reclassify_frames():
 
 
 def extract_frames():
-    """
-    Mode A: Extract frames from video, skip blurry ones, save to FRAMES_DIR.
-    """
-    logging.info(f"--- Starting Extraction Mode ---")
+    """Extract quality frames from video into good/, blurry/, rejected/."""
+    logging.info("--- Starting Extraction Mode ---")
     logging.info(f"Video: {CONFIG.VIDEO_PATH}")
     logging.info(f"Smart Extract: {CONFIG.SMART_EXTRACT}")
 
@@ -501,8 +540,6 @@ def extract_frames():
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration_sec = total_frames / fps if fps > 0 else 0
-
     duration_sec = total_frames / fps if fps > 0 else 0
 
     logging.info(f"Duration: {duration_sec:.2f} seconds. FPS: {fps:.2f}")
@@ -567,8 +604,7 @@ def extract_frames():
             else:
                 # Content OR Motion detected! Worth scanning for the sharpest
                 # frame.
-                frames_to_read = min(
-                    frames_to_skip, total_frames - current_frame)
+                frames_to_read = min(frames_to_skip, total_frames - current_frame)
 
                 # Reset to start of interval (since we read one frame)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
@@ -626,7 +662,8 @@ def extract_frames():
                 ret_next, next_frame_fast = cap.read()
                 if ret_next:
                     is_moving, motion_score = detect_motion(
-                        final_frame, next_frame_fast)
+                        final_frame, next_frame_fast
+                    )
 
             # In SMART_EXTRACT, we might have scanned multiple frames.
             # Ideally we check motion ON the chosen frame vs its neighbor.
@@ -684,67 +721,72 @@ def extract_frames():
 
     estimated_cost = saved_count * CONFIG.COST_PER_IMAGE
 
-    logging.info(f"Extraction complete.")
+    logging.info("Extraction complete.")
     logging.info(
-        f"Saved: {saved_count} sharp, interesting frames to '{
-            CONFIG.FRAMES_DIR}'.")
+        f"Saved: {saved_count} sharp, interesting frames to '{CONFIG.FRAMES_DIR}'."
+    )
     logging.info(
-        f"Rejected content: {rejected_empty_count} frames to '{
-            CONFIG.REJECTED_DIR}'.")
+        f"Rejected content: {rejected_empty_count} frames to '{CONFIG.REJECTED_DIR}'."
+    )
+    logging.info(f"Rejected blurry: {blurry_count} frames to '{CONFIG.BLURRY_DIR}'.")
     logging.info(
-        f"Rejected blurry: {blurry_count} frames to '{
-            CONFIG.BLURRY_DIR}'.")
-    logging.info(
-        f"Estimated Analysis Cost: ${
-            estimated_cost:.4f} (based on Gemini Flash rates).")
+        f"Estimated Analysis Cost: ${estimated_cost:.4f} (based on Gemini Flash rates)."
+    )
     logging.info(
         f"Please review rejected folders and move any missed fish to '{
-            CONFIG.FRAMES_DIR}' before analysis.")
+            CONFIG.FRAMES_DIR
+        }' before analysis."
+    )
 
 
-def parse_gemini_response(text):
-    """
-    Robustly parses JSON from Gemini response, handling markdown blocks and list wrapping.
-    Returns dict or {}.
-    """
+def parse_ai_response(text):
+    """Parses JSON from AI response, handling markdown fences. Always returns a list of dicts."""
     text = text.strip()
 
-    # Clean up markdown code blocks
     if "```" in text:
         parts = text.split("```")
         for part in parts:
-            if "{" in part:
-                text = part.replace("json", "").strip()
+            if "[" in part or "{" in part:
+                text = re.sub(r"^json\s*", "", part).strip()
                 break
 
-    data = {}
+    data = None
     try:
         data = json.loads(text)
-    except BaseException:
+    except Exception:
         try:
             data = ast.literal_eval(text)
-        except BaseException:
+        except Exception:
             pass
 
-    # Handle list response (e.g. [{...}])
-    if isinstance(data, list) and len(data) > 0:
-        data = data[0]
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
 
-    if not isinstance(data, dict):
-        return {}
-
-    return data
+    return [item for item in data if isinstance(item, dict)]
 
 
-@retry(wait=wait_exponential(multiplier=2, min=4,
-       max=120), stop=stop_after_attempt(10))
-def call_gemini_api(client, prompt, image):
+@retry(
+    wait=wait_exponential(multiplier=2, min=4, max=120),
+    stop=stop_after_attempt(10),
+    retry=retry_if_exception_type(
+        (
+            exceptions.ResourceExhausted,
+            exceptions.ServiceUnavailable,
+            exceptions.DeadlineExceeded,
+        )
+    ),
+)
+def call_gemini_api(client, prompt, *images):
     try:
+        _api_rate_limiter.wait()
         logging.debug(f"Sending request to Gemini ({CONFIG.MODEL_NAME})...")
         start_t = time.time()
         response = client.models.generate_content(
             model=CONFIG.MODEL_NAME,
-            contents=[prompt, image]
+            contents=[prompt, *images],
+            config=types.GenerateContentConfig(temperature=0),
         )
         logging.debug(f"Response received in {time.time() - start_t:.2f}s")
         return response
@@ -753,22 +795,85 @@ def call_gemini_api(client, prompt, image):
         raise e
 
 
+def _is_anthropic_retryable(exc):
+    """Only retry on rate limits and transient connection errors, not billing/auth failures."""
+    if _anthropic is None:
+        return False
+    if isinstance(exc, _anthropic.RateLimitError):
+        return True
+    if isinstance(exc, _anthropic.APIConnectionError):
+        return True
+    if isinstance(exc, _anthropic.APIStatusError):
+        return (
+            exc.status_code >= 500
+        )  # 5xx = server error, retryable; 4xx = client error, not retryable
+    return False
+
+
+@retry(
+    wait=wait_exponential(multiplier=2, min=4, max=120),
+    stop=stop_after_attempt(10),
+    retry=retry_if_exception(_is_anthropic_retryable),
+    reraise=True,
+)
+def call_anthropic_api(client, prompt, *images):
+    """Encode PIL images as base64 and call the Anthropic Messages API."""
+    if _anthropic is None:
+        raise RuntimeError(
+            "anthropic package not installed. Run: pip install anthropic"
+        )
+    _api_rate_limiter.wait()
+    logging.debug(f"Sending request to Anthropic ({CONFIG.MODEL_NAME})...")
+    start_t = time.time()
+    content = []
+    for img in images:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+        content.append(
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+            }
+        )
+    content.append({"type": "text", "text": prompt})
+    try:
+        response = client.messages.create(
+            model=CONFIG.MODEL_NAME,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": content}],
+        )
+        logging.debug(f"Response received in {time.time() - start_t:.2f}s")
+        return response.content[0].text
+    except Exception as e:
+        logging.warning(f"Anthropic API error: {e}")
+        raise
+
+
+def call_ai_api(client, prompt, *images):
+    """Dispatch to the configured provider and return the response text."""
+    if CONFIG.PROVIDER == "anthropic":
+        return call_anthropic_api(client, prompt, *images)
+    return call_gemini_api(client, prompt, *images).text
+
+
 def get_video_creation_date(video_path):
-    """
-    Extracts the creation time from video metadata using ffprobe.
-    Returns "YYYY-MM-DD" string or None if failed.
-    """
+    """Returns 'YYYY-MM-DD' from video metadata via ffprobe, or None."""
     try:
         # Command: ffprobe -v quiet -select_streams v:0 -show_entries
         # stream_tags=creation_time -of default=noprint_wrappers=1:nokey=1
         # [FILE]
         cmd = [
             "ffprobe",
-            "-v", "quiet",
-            "-select_streams", "v:0",
-            "-show_entries", "stream_tags=creation_time",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            video_path
+            "-v",
+            "quiet",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream_tags=creation_time",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            video_path,
         ]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -788,9 +893,7 @@ def get_video_creation_date(video_path):
 
 
 def sort_session_log(log_path):
-    """
-    Sorts the CSV log file by the first column (timestamp).
-    """
+    """Sorts the CSV log in-place by timestamp."""
     if not os.path.exists(log_path):
         return
 
@@ -798,7 +901,7 @@ def sort_session_log(log_path):
     header = []
 
     try:
-        with open(log_path, 'r', newline='', encoding='utf-8') as f:
+        with open(log_path, "r", newline="", encoding="utf-8") as f:
             reader = csv.reader(f)
             try:
                 header = next(reader)
@@ -810,7 +913,7 @@ def sort_session_log(log_path):
         # Timestamp format 00:00 or 00:00:00 sorts correctly as string
         rows.sort(key=lambda x: x[0])
 
-        with open(log_path, 'w', newline='', encoding='utf-8') as f:
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(header)
             writer.writerows(rows)
@@ -820,236 +923,276 @@ def sort_session_log(log_path):
         logging.warning(f"Warning: Could not sort log file: {e}")
 
 
+def get_context_frames(timestamp_str, count=3):
+    """Return up to `count` PIL Images centered on timestamp_str for multi-frame context."""
+    if count <= 1 or not os.path.exists(CONFIG.VIDEO_PATH):
+        return []
+    try:
+        parts = timestamp_str.split(":")
+        target_sec = int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        return []
+
+    cap = cv2.VideoCapture(CONFIG.VIDEO_PATH)
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    center = int(target_sec * fps)
+    half = int(fps / 2)
+    start = max(0, center - half)
+    end = min(total_frames - 1, center + half)
+
+    indices = [int(start + i * (end - start) / max(count - 1, 1)) for i in range(count)]
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            frames.append(PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+
+    cap.release()
+    return frames
+
+
 def analyze_frames():
-    """
-    Mode B: Send images in FRAMES_DIR and MANUAL_DIR to Gemini Flash.
-    """
-    logging.info(f"--- Starting Analysis Mode ---")
+    """Identify species in extracted frames using the configured AI provider. Resume-safe; rebuilds youtube_chapters.txt on completion."""
+    logging.info("--- Starting Analysis Mode ---")
+    logging.info(f"Provider: {CONFIG.PROVIDER} | Model: {CONFIG.MODEL_NAME}")
 
     ensure_directories(clear=False)
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    if CONFIG.PROVIDER == "anthropic":
+        if _anthropic is None:
+            logging.error("anthropic package not installed. Run: pip install anthropic")
+            return
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or CONFIG.ANTHROPIC_API_KEY
+        if not api_key:
+            logging.error("ANTHROPIC_API_KEY not set in config.py or environment.")
+            return
+        client = _anthropic.Anthropic(api_key=api_key)
+    else:
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            logging.error("GOOGLE_API_KEY environment variable not set.")
+            return
+        client = genai.Client(api_key=api_key)
 
-    # Paths
-    dir_good = CONFIG.FRAMES_DIR
-    if not api_key:
-        logging.error("Error: GOOGLE_API_KEY environment variable not set.")
-        return
-
-    client = genai.Client(api_key=api_key)
-
-    # Get list of images, sorted by time (filename)
-    # We now also look in MANUAL_DIR for user-forced images
     files_main = glob.glob(os.path.join(CONFIG.FRAMES_DIR, "*.jpg"))
     files_manual = glob.glob(os.path.join(CONFIG.MANUAL_DIR, "*.jpg"))
-
-    image_files = sorted(
-        files_main + files_manual,
-        key=lambda x: os.path.basename(x))
+    image_files = sorted(files_main + files_manual, key=lambda x: os.path.basename(x))
 
     if not image_files:
         logging.error(
-            f"No images found in {
-                CONFIG.FRAMES_DIR} or {
-                CONFIG.MANUAL_DIR}. Run 'extract' mode first.")
+            f"No images found in {CONFIG.FRAMES_DIR} or {CONFIG.MANUAL_DIR}. Run 'extract' mode first."
+        )
         return
 
-    # Initialize CSV with header if it doesn't exist
     log_file = get_session_log_path()
     processed_files = set()
 
     logging.info(f"Session Log File: {log_file}")
 
     if not os.path.exists(log_file):
-        with open(log_file, "w", newline='', encoding='utf-8') as f:
+        with open(log_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-            writer.writerow(["timestamp", "file", "common_name",
-                            "scientific_name", "confidence"])
+            writer.writerow(
+                ["timestamp", "file", "common_name", "scientific_name", "confidence"]
+            )
     else:
-        # Read existing to skip duplicates
         try:
-            with open(log_file, "r", newline='', encoding='utf-8') as f:
+            with open(log_file, "r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # Check if file column exists (it might be index 1 based on
-                    # old logic, but DictReader uses header)
                     if row.get("file"):
                         processed_files.add(row["file"])
             logging.info(
-                f"Resuming analysis. {
-                    len(processed_files)} images already processed.")
+                f"Resuming analysis. {len(processed_files)} images already processed."
+            )
         except Exception as e:
             logging.error(f"Error reading existing log: {e}")
 
     logging.info(
-        f"Found {
-            len(image_files)} images total ({
-            len(files_manual)} manual overrides).")
+        f"Found {len(image_files)} images total ({len(files_manual)} manual overrides)."
+    )
 
-    youtube_chapters = []
-    last_species_name = None
-
-    # 1. Get Date Context (Once per session)
     video_date = get_video_creation_date(CONFIG.VIDEO_PATH)
     date_context = f"Date: {video_date}. " if video_date else ""
 
-    for img_path in tqdm(image_files, desc="Analyzing"):
-        base_name = os.path.basename(img_path)
-        if base_name in processed_files:
-            continue
+    try:
+        scan_prompt = CONFIG.ANALYSIS_PROMPT.format(
+            location=CONFIG.LOCATION_CONTEXT,
+            date=date_context,
+            n=CONFIG.CONTEXT_FRAMES,
+        )
+    except Exception as e:
+        scan_prompt = CONFIG.ANALYSIS_PROMPT
+        logging.warning(f"Prompt formatting failed ({e}). Using raw prompt.")
 
+    pending = [p for p in image_files if os.path.basename(p) not in processed_files]
+
+    csv_lock = threading.Lock()
+    chapter_entries = []
+
+    _UNKNOWN_SCI = {"unknown", "null", "none", ""}
+
+    def _filter_species(raw_list):
+        """Filter a parsed species list, returning only valid identifiable entries."""
+        results = []
+        for item in raw_list:
+            name = (item.get("common_name") or "").strip()
+            sci = (item.get("scientific_name") or "").strip()
+            conf = float(item.get("confidence") or 0.0)
+            if not name or name.lower() in CONFIG.INANIMATE_OBJECTS:
+                continue
+            if sci.lower() in _UNKNOWN_SCI:
+                continue
+            results.append((name, sci, conf))
+        return results
+
+    def process_frame(img_path):
+        base_name = os.path.basename(img_path)
         timestamp_str = get_timestamp_from_filename(img_path)
 
         try:
-            # 1. Get Date Context
-            # We fetch it once if not already fetched, or just fetch it here (it's fast)
-            # MOVED OUTSIDE LOOP
+            images = get_context_frames(timestamp_str, CONFIG.CONTEXT_FRAMES)
+            if not images:
+                images = [PIL.Image.open(img_path)]
 
-            # We construct a prompt
-            # Use format to inject location/date into the config template
-            # Note: We use safe formatting or just .format() if we trust the
-            # string
-            try:
-                # Handle potential missing placeholders in user config safely
-                scan_prompt = CONFIG.ANALYSIS_PROMPT.format(
-                    location=CONFIG.LOCATION_CONTEXT, date=date_context)
-            except Exception as e:
-                # Fallback if format fails (e.g. user removed placeholders)
-                scan_prompt = CONFIG.ANALYSIS_PROMPT
-                logging.warning(
-                    f"Prompt formatting failed ({e}). Using raw prompt.")
+            text = call_ai_api(client, scan_prompt, *images)
+            species = _filter_species(parse_ai_response(text))
 
-            # Use PIL to load the image
-            image = PIL.Image.open(img_path)
-
-            # Send to Gemini
-            logging.debug(f"Analyzing {base_name}...")
-            response = call_gemini_api(client, scan_prompt, image)
-
-            # Parse JSON
-            data = parse_gemini_response(response.text)
-
-            common_name = data.get("common_name")
-            scientific_name = data.get("scientific_name")
-            confidence = float(data.get("confidence", 0.0))
-
-            # Filter Inanimate Objects
-            # If names are None/null or generic "background" terms
-            if not common_name or common_name.lower() in CONFIG.INANIMATE_OBJECTS:
-                logging.info(
-                    f"  > Skipping inanimate/empty frame ({common_name}).")
-                continue
-
-            common_name = common_name or "Unknown"
-            scientific_name = scientific_name or "Unknown"
-
-            # SMART RETRY LOGIC
-            if CONFIG.SMART_RETRY and confidence < CONFIG.RETRY_CONFIDENCE_THRESHOLD:
-                logging.info(
-                    f"  > Low confidence ({
-                        confidence:.2f} < {
-                        CONFIG.RETRY_CONFIDENCE_THRESHOLD}). Attempting Smart Retry...")
-                logging.debug(
-                    f"Searching for better frame at {timestamp_str}...")
-
-                # 1. Find better frame
+            if not species and CONFIG.SMART_RETRY:
+                logging.info(f"  > {base_name}: no valid IDs. Attempting Smart Retry...")
                 better_frame, b_score = find_best_frame_at_timestamp(
-                    CONFIG.VIDEO_PATH, timestamp_str)
-
+                    CONFIG.VIDEO_PATH, timestamp_str
+                )
                 if better_frame is not None:
                     logging.info(
-                        f"  > Found replacement frame (Blur Score: {
-                            b_score:.1f}). Re-analyzing...")
-
-                    # 2. Overwrite file on disk (so user sees the better one)
+                        f"  > Found replacement frame (blur score: {b_score:.1f}). Re-analyzing..."
+                    )
                     cv2.imwrite(img_path, better_frame)
-
-                    # 3. Convert CV2 frame to PIL for Gemini
-                    frame_rgb = cv2.cvtColor(better_frame, cv2.COLOR_BGR2RGB)
-                    pil_image = PIL.Image.fromarray(frame_rgb)
-
-                    # 4. Call API again
+                    pil_retry = PIL.Image.fromarray(
+                        cv2.cvtColor(better_frame, cv2.COLOR_BGR2RGB)
+                    )
                     try:
-                        response_retry = call_gemini_api(
-                            client, scan_prompt, pil_image)
-
-                        data_retry = parse_gemini_response(response_retry.text)
-
-                        new_conf = float(data_retry.get("confidence", 0.0))
-                        new_name = data_retry.get("common_name")
-
-                        # Check if retry thinks it's inanimate too
-                        if not new_name or new_name.lower() in CONFIG.INANIMATE_OBJECTS:
-                            logging.info(
-                                f"  > Retry found inanimate object ({new_name}). Skipping.")
-                            continue
-
-                        if new_conf > confidence:
-                            logging.info(
-                                f"  > Retry SUCCESS! Confidence improved: {confidence:.2f} -> {new_conf:.2f}")
-                            # Accept new data
-                            common_name = new_name
-                            scientific_name = data_retry.get(
-                                "scientific_name") or "Unknown"
-                            confidence = new_conf
+                        text2 = call_ai_api(client, scan_prompt, pil_retry)
+                        species = _filter_species(parse_ai_response(text2))
+                        if species:
+                            logging.info(f"  > Retry found {len(species)} species.")
                         else:
-                            logging.info(
-                                f"  > Retry failed to improve confidence ({
-                                    new_conf:.2f}). Keeping original.")
-
+                            logging.info("  > Retry returned no valid IDs. Skipping.")
                     except Exception as retry_err:
-                        logging.warning(
-                            f"  > Retry API call failed: {retry_err}")
+                        logging.warning(f"  > Retry failed: {retry_err}")
                 else:
-                    logging.warning("  > Could not extract a better frame.")
+                    logging.warning("  > Could not find a better frame.")
 
-            # Save to log immediately
+            if not species:
+                logging.info(f"  > {base_name}: no animals detected.")
+                return []
 
-            # Save to log immediately
-            # Save result to CSV
-            with open(log_file, "a", newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    [timestamp_str, base_name, common_name, scientific_name, f"{confidence:.2f}"])
-
-            # Rate Limit Delay
-            if CONFIG.API_DELAY > 0:
-                time.sleep(CONFIG.API_DELAY)
-
-            # Deduplication for chapters
-            if confidence >= CONFIG.CONFIDENCE_THRESHOLD:
-                # Chapter format: "00:05 - Sergeant Major (Abudefduf saxatilis)
-                # [0.95]"
-                entry_name = f"{common_name} ({scientific_name})"
-                if entry_name != last_species_name:
-                    youtube_chapters.append(
-                        f"{timestamp_str} - {entry_name} [{confidence:.2f}]")
-                    last_species_name = entry_name
-
-            # Respect Rate Limits (Free tier is often ~15 req/min)
-            # time.sleep(10) # REMOVED: Relying on CONFIG.API_DELAY
+            logging.info(
+                f"  > {base_name}: {', '.join(n for n, _, _ in species)}"
+            )
+            return [
+                {
+                    "timestamp": timestamp_str,
+                    "base_name": base_name,
+                    "common_name": name,
+                    "scientific_name": sci,
+                    "confidence": conf,
+                }
+                for name, sci, conf in species
+            ]
 
         except Exception as e:
             logging.error(f"\nError processing {img_path}: {e}")
-            if hasattr(e, 'message'):
-                logging.error(f"Message: {e.message}")
-            if hasattr(e, 'code'):
-                logging.error(f"Code: {e.code}")
-            # If it's a RetryError, getting the cause is helpful
-            if hasattr(e, 'last_attempt') and e.last_attempt.exception():
-                logging.error(
-                    f"Original Exception: {
-                        e.last_attempt.exception()}")
+            if hasattr(e, "last_attempt") and e.last_attempt.exception():
+                logging.error(f"Original Exception: {e.last_attempt.exception()}")
+            return []
 
-            # time.sleep(10) # REMOVED: Relying on CONFIG.API_DELAY
+    logging.info(
+        f"Analyzing {len(pending)} frames with {CONFIG.MAX_WORKERS} worker(s)..."
+    )
 
-    # Save Chapters
-    if youtube_chapters:
+    with ThreadPoolExecutor(max_workers=CONFIG.MAX_WORKERS) as executor:
+        futures = {executor.submit(process_frame, p): p for p in pending}
+
+        for future in tqdm(as_completed(futures), total=len(pending), desc="Analyzing"):
+            results = future.result()
+            if not results:
+                continue
+
+            with csv_lock:
+                with open(log_file, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+                    for result in results:
+                        writer.writerow(
+                            [
+                                result["timestamp"],
+                                result["base_name"],
+                                result["common_name"],
+                                result["scientific_name"],
+                                f"{result['confidence']:.2f}",
+                            ]
+                        )
+
+            for result in results:
+                if result["confidence"] >= CONFIG.CONFIDENCE_THRESHOLD:
+                    entry = f"{result['common_name']} ({result['scientific_name']})"
+                    chapter_entries.append(
+                        (result["timestamp"], entry, result["confidence"])
+                    )
+
+    # Regenerate chapters from the full CSV so resumes produce a complete file.
+    # Normalize common names: for each scientific name, use whichever common name
+    # appears most frequently (ties broken by highest confidence).
+    all_rows = []
+    name_votes = {}  # scientific_name -> {common_name: count}
+    try:
+        with open(log_file, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                all_rows.append(row)
+                sci = row.get("scientific_name", "").strip()
+                common = row.get("common_name", "").strip()
+                if sci and common:
+                    name_votes.setdefault(sci, {})
+                    name_votes[sci][common] = name_votes[sci].get(common, 0) + 1
+    except Exception as e:
+        logging.warning(f"Could not read log for chapters: {e}")
+
+    canonical = {sci: max(counts, key=counts.get) for sci, counts in name_votes.items()}
+
+    all_entries = []
+    for row in all_rows:
+        conf = float(row.get("confidence") or 0)
+        sci = row.get("scientific_name", "").strip()
+        common = canonical.get(sci, row.get("common_name", "")).strip()
+        if (
+            conf >= CONFIG.CONFIDENCE_THRESHOLD
+            and common
+            and common.lower() not in CONFIG.INANIMATE_OBJECTS
+        ):
+            entry = f"{common} ({sci})"
+            all_entries.append((row["timestamp"], entry, conf))
+
+    if all_entries:
+        all_entries.sort(key=lambda x: x[0])
+        chapters = []
+        prev_species: set[str] = set()
+        # Group by timestamp so multi-species frames suppress correctly
+        for ts, group in groupby(all_entries, key=lambda x: x[0]):
+            group = list(group)
+            curr_species: set[str] = {e.lower() for _, e, _ in group}
+            for _, entry, conf in group:
+                if entry.lower() not in prev_species:
+                    chapters.append(f"{ts} - {entry} [{conf:.2f}]")
+            prev_species = curr_species
         with open("youtube_chapters.txt", "w") as f:
-            f.write("\n".join(youtube_chapters))
+            f.write("\n".join(chapters))
         logging.info("Saved youtube_chapters.txt")
 
-    # Sort the log file
     sort_session_log(log_file)
 
 
@@ -1065,18 +1208,17 @@ def get_scores(directory):
             continue
         _, blur = is_blurry(image)
         _, content = has_content(image)
-        scores.append({
-            'file': os.path.basename(fpath),
-            'blur': blur,
-            'content': content
-        })
+        scores.append(
+            {"file": os.path.basename(fpath), "blur": blur, "content": content}
+        )
     return scores
 
 
 def tune():
     logging.info("--- Advanced Auto-Tuning Configuration ---")
     logging.info(
-        "This script analyzes your manual sorting to find the best thresholds.")
+        "This script analyzes your manual sorting to find the best thresholds."
+    )
 
     # Paths
     dir_good = CONFIG.FRAMES_DIR
@@ -1095,66 +1237,73 @@ def tune():
 
     if not good_stats:
         logging.error(
-            f"Error: No images found in '{dir_good}'. You must have at least one 'good' frame to tune thresholds.")
+            f"Error: No images found in '{dir_good}'. You must have at least one 'good' frame to tune thresholds."
+        )
         return
 
     # 2. Determine Optimal Thresholds
     # Constraint 1: Must accept ALL good files.
     # We find the 'worst' good file and set the bar just below it.
-    min_good_blur = min(s['blur'] for s in good_stats)
-    min_good_content = min(s['content'] for s in good_stats)
+    min_good_blur = min(s["blur"] for s in good_stats)
+    min_good_content = min(s["content"] for s in good_stats)
 
     # Proposed new thresholds (slightly relaxed to ensure inclusion)
     new_blur_thresh = max(0.0, min_good_blur - 0.1)
     new_content_thresh = max(0.0, min_good_content - 0.0001)
 
     # 3. Analyze Trade-offs (Overlap)
-    false_positive_blurry = [
-        s for s in blurry_stats if s['blur'] >= new_blur_thresh]
+    false_positive_blurry = [s for s in blurry_stats if s["blur"] >= new_blur_thresh]
     false_positive_rejected = [
-        s for s in rejected_stats if s['content'] > new_content_thresh]
+        s for s in rejected_stats if s["content"] > new_content_thresh
+    ]
 
     logging.info("\n--- Analysis Results ---")
     logging.info(f"Total Good Files: {len(good_stats)}")
     logging.info(f"  Min Blur Score found: {min_good_blur:.2f}")
     logging.info(f"  Min Content Score found: {min_good_content:.5f}")
 
-    logging.info(f"\nProposed Config:")
+    logging.info("\nProposed Config:")
     logging.info(
-        f"  BLUR_THRESHOLD:        {
-            new_blur_thresh:.4f} (was {
-            CONFIG.BLUR_THRESHOLD})")
+        f"  BLUR_THRESHOLD:        {new_blur_thresh:.4f} (was {CONFIG.BLUR_THRESHOLD})"
+    )
     logging.info(
-        f"  MIN_CONTENT_THRESHOLD: {
-            new_content_thresh:.5f} (was {
-            CONFIG.MIN_CONTENT_THRESHOLD})")
+        f"  MIN_CONTENT_THRESHOLD: {new_content_thresh:.5f} (was {
+            CONFIG.MIN_CONTENT_THRESHOLD
+        })"
+    )
 
-    print("\n--- Impact Analysis ---")
+    logging.info("\n--- Impact Analysis ---")
     if false_positive_blurry:
         logging.warning(
-            f"WARNING: {
-                len(false_positive_blurry)} images from '{dir_blurry}' will now be considered SHARP.")
+            f"WARNING: {len(false_positive_blurry)} images from '{
+                dir_blurry
+            }' will now be considered SHARP."
+        )
         logging.warning(f"  (They have blur scores >= {new_blur_thresh:.4f}).")
     else:
         logging.info(
-            f"Perfect Separation! No images from '{dir_blurry}' will be falsely accepted.")
+            f"Perfect Separation! No images from '{dir_blurry}' will be falsely accepted."
+        )
 
     if false_positive_rejected:
         logging.warning(
-            f"WARNING: {
-                len(false_positive_rejected)} images from '{dir_rejected}' will now be considered VALID CONTENT.")
-        logging.warning(
-            f"  (They have content scores > {
-                new_content_thresh:.5f}).")
+            f"WARNING: {len(false_positive_rejected)} images from '{
+                dir_rejected
+            }' will now be considered VALID CONTENT."
+        )
+        logging.warning(f"  (They have content scores > {new_content_thresh:.5f}).")
     else:
         logging.info(
-            f"Perfect Separation! No images from '{dir_rejected}' will be falsely accepted.")
+            f"Perfect Separation! No images from '{dir_rejected}' will be falsely accepted."
+        )
 
     # 4. Apply & Verify
-    print("\nTo keep all your 'Good' files, we must update the config to the Proposed values.")
+    logging.info(
+        "\nTo keep all your 'Good' files, we must update the config to the Proposed values."
+    )
     confirm = input("Update config.py and RERUN extraction to verify? (y/n): ")
 
-    if confirm.lower() == 'y':
+    if confirm.lower() == "y":
         # Update Config
         try:
             # Create Backup
@@ -1175,8 +1324,7 @@ def tune():
                     comment = ""
                     if "#" in line:
                         comment = " # " + line.split("#", 1)[1].strip()
-                    new_lines.append(
-                        f"BLUR_THRESHOLD = {new_blur_thresh}{comment}\n")
+                    new_lines.append(f"BLUR_THRESHOLD = {new_blur_thresh}{comment}\n")
 
                 # Update MIN_CONTENT_THRESHOLD
                 elif line.strip().startswith("MIN_CONTENT_THRESHOLD"):
@@ -1184,7 +1332,8 @@ def tune():
                     if "#" in line:
                         comment = " # " + line.split("#", 1)[1].strip()
                     new_lines.append(
-                        f"MIN_CONTENT_THRESHOLD = {new_content_thresh}{comment}\n")
+                        f"MIN_CONTENT_THRESHOLD = {new_content_thresh}{comment}\n"
+                    )
                 else:
                     new_lines.append(line)
 
@@ -1196,19 +1345,20 @@ def tune():
             # Since we changed a python module, we must reload config in memory
             CONFIG.load()
 
-            print("\n--- Verification ---")
-            print("To see the effect of your changes, you can either:")
-            print("  [s] Re-sort existing images (FAST, ~seconds)")
-            print("  [e] Re-extract from video (SLOW, ~minutes)")
-            print("  [n] Skip verification")
+            logging.info("\n--- Verification ---")
+            logging.info("To see the effect of your changes, you can either:")
+            logging.info("  [s] Re-sort existing images (FAST, ~seconds)")
+            logging.info("  [e] Re-extract from video (SLOW, ~minutes)")
+            logging.info("  [n] Skip verification")
 
             choice = input("Choice [s/e/n]: ").lower()
 
-            if choice == 's':
+            if choice == "s":
                 reclassify_frames()
-            elif choice == 'e':
+            elif choice == "e":
                 logging.warning(
-                    "WARNING: This will clear your manual sorting folders and re-extract from the video.")
+                    "WARNING: This will clear your manual sorting folders and re-extract from the video."
+                )
                 extract_frames()
             else:
                 logging.info("Verification skipped.")
@@ -1220,20 +1370,8 @@ def tune():
 
 
 def refine_selected_frames():
-    """
-    Mode: Refine
-    Scans for 'candidate' images to upgrade:
-      1. All images in MANUAL_DIR.
-      2. Images in FRAMES_DIR that have suffixes (e.g. _blur90, _empty0.01),
-         indicating they were manually moved there from rejection folders.
-
-    For each candidate:
-      - Go back to video at timestamp.
-      - Smart Scan (1 sec) to find sharpest frame.
-      - Save as clean filename (frame_MMm_SSs.jpg) in the same folder.
-      - Delete the old 'dirty' filename.
-    """
-    logging.info(f"--- Starting Refine Mode ---")
+    """Replace manual/ frames and suffixed good/ frames with the sharpest frame from the same video second."""
+    logging.info("--- Starting Refine Mode ---")
 
     candidates = []  # List of (path, directory)
 
@@ -1243,7 +1381,6 @@ def refine_selected_frames():
         for f in files:
             candidates.append((f, CONFIG.MANUAL_DIR))
 
-    # 2. Gather Good Files (Only suffixed)
     # 2. Gather Good Files (Only suffixed)
     suffix_pattern = re.compile(r"(_blur\d+|_empty[\d\.]+)(\.jpg)$")
 
@@ -1256,14 +1393,14 @@ def refine_selected_frames():
     if not candidates:
         logging.info("No files found to refine.")
         logging.info(
-            f"Checked {
-                CONFIG.MANUAL_DIR} (All) and {
-                CONFIG.FRAMES_DIR} (Only files with _blur/_empty suffixes).")
+            f"Checked {CONFIG.MANUAL_DIR} (All) and {
+                CONFIG.FRAMES_DIR
+            } (Only files with _blur/_empty suffixes)."
+        )
         return
 
     logging.info(f"Found {len(candidates)} images to refine.")
 
-    cap = cv2.VideoCapture(CONFIG.VIDEO_PATH)
     cap = cv2.VideoCapture(CONFIG.VIDEO_PATH)
     if not cap.isOpened():
         logging.error("Error: Could not open video.")
@@ -1275,37 +1412,12 @@ def refine_selected_frames():
 
     refined_count = 0
 
-    for (img_path, dest_dir) in tqdm(candidates, desc="Refining"):
+    for img_path, dest_dir in tqdm(candidates, desc="Refining"):
         basename = os.path.basename(img_path)
         try:
-            # Parse timestamp: frame_MMm_SSs...
-            # We must handle potential suffixes like frame_00m_05s_blur90.jpg
-            # Strategy: Split by underscore, look for 'm' and 's' parts.
-            parts = basename.split("_")
-
-            # Filter for parts containing digits
-            # usually: ['frame', '00m', '05s', 'blur90.jpg']
-
-            mnt_part = None
-            sec_part = None
-
-            for p in parts:
-                if 'm' in p and p[:-1].isdigit():  # e.g. 00m
-                    mnt_part = p
-                elif 's' in p and p[:-1].isdigit():  # e.g. 05s
-                    sec_part = p
-                elif 's' in p and '.jpg' in p:  # e.g. 05s.jpg (clean case)
-                    sub = p.replace('.jpg', '')
-                    if sub[:-1].isdigit():
-                        sec_part = sub
-                # Handle suffix cases like 05s_blur... might be split
-
-            # Robust fallback: Use regex on the whole string
-            # frame_(\d+)m_(\d+)s
             time_match = re.search(r"frame_(\d+)m_(\d+)s", basename)
             if not time_match:
-                logging.debug(
-                    f"Skipping {basename}: cannot parse timestamp pattern.")
+                logging.debug(f"Skipping {basename}: cannot parse timestamp pattern.")
                 continue
 
             minutes = int(time_match.group(1))
@@ -1357,12 +1469,7 @@ def refine_selected_frames():
 
 
 def archive_log():
-    """
-    Mode: Archive
-    Reads the current session's sighting_log.csv and appends it to master_sighting_log.csv.
-    Adds metadata columns: Date, Location, Video Name.
-    Prevents duplicates based on Video + Timestamp.
-    """
+    """Enrich session CSV with date/location/video metadata and append to master_sighting_log.csv. Deduplicates on video+timestamp."""
     logging.info("--- Archiving Session Log ---")
 
     current_log = get_session_log_path()
@@ -1385,7 +1492,7 @@ def archive_log():
     new_entries = []
 
     try:
-        with open(current_log, "r", newline='', encoding='utf-8') as f:
+        with open(current_log, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 # Expects keys:
@@ -1401,7 +1508,7 @@ def archive_log():
                     "timestamp": row["timestamp"],
                     "common_name": row["common_name"],
                     "scientific_name": row["scientific_name"],
-                    "confidence": row["confidence"]
+                    "confidence": row["confidence"],
                 }
                 new_entries.append(entry)
     except Exception as e:
@@ -1421,12 +1528,13 @@ def archive_log():
         "timestamp",
         "common_name",
         "scientific_name",
-        "confidence"]
+        "confidence",
+    ]
     file_exists = os.path.exists(master_log)
 
     if file_exists:
         try:
-            with open(master_log, "r", newline='', encoding='utf-8') as f:
+            with open(master_log, "r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     # Key: Video + Timestamp
@@ -1437,15 +1545,15 @@ def archive_log():
                         existing_keys.add(f"{v}_{t}")
         except Exception as e:
             logging.warning(
-                f"Warning: Could not read master log (might be corrupt): {e}")
+                f"Warning: Could not read master log (might be corrupt): {e}"
+            )
 
     # Append
     added_count = 0
     mode = "a" if file_exists else "w"
 
-    with open(master_log, mode, newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(
-            f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+    with open(master_log, mode, newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         if not file_exists:
             writer.writeheader()
 
@@ -1456,23 +1564,16 @@ def archive_log():
                 added_count += 1
 
     logging.info(f"Archived {added_count} new sightings to {master_log}.")
-    logging.info(
-        f"Total Master Log Size: {
-            len(existing_keys) +
-            added_count} entries.")
+    logging.info(f"Total Master Log Size: {len(existing_keys) + added_count} entries.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wildlife Video Analyzer")
     parser.add_argument(
         "mode",
-        choices=[
-            "extract",
-            "analyze",
-            "refine",
-            "tune",
-            "archive"],
-        help="Operation mode")
+        choices=["extract", "analyze", "refine", "tune", "archive"],
+        help="Operation mode",
+    )
 
     # Handle the case where no args are passed
     if len(sys.argv) == 1:
@@ -1481,21 +1582,36 @@ if __name__ == "__main__":
         print("Usage: python wildlife_analyzer.py [mode]\n")
         print("Modes:")
         print("  extract   : Reads video and saves frames to 'extracted_images/good'.")
-        print("              - Use 'SMART_EXTRACT': true in config for hybrid scanning.")
+        print(
+            "              - Use 'SMART_EXTRACT': true in config for hybrid scanning."
+        )
         print("              - Filters out blurry and empty frames automatically.\n")
 
-        print("  tune      : Optimizes detection thresholds based on your manual sorting.")
-        print("              - Sort files into extracted_images/good (Keep) / _blurry / _rejected.")
-        print("              - Move blurry-but-good files to 'extracted_images/manual'.")
         print(
-            "              - AUTO-REFINES manual frames (better quality) before tuning.\n")
+            "  tune      : Optimizes detection thresholds based on your manual sorting."
+        )
+        print(
+            "              - Sort files into extracted_images/good (Keep) / _blurry / _rejected."
+        )
+        print(
+            "              - Move blurry-but-good files to 'extracted_images/manual'."
+        )
+        print(
+            "              - AUTO-REFINES manual frames (better quality) before tuning.\n"
+        )
 
-        print("  analyze   : Identifies species using Google Gemini 2.0 Flash.")
-        print("              - Smart Retry: Re-scans video if confidence < 85%.")
-        print("              - Smart Filter: Ignores rocks/sand/gravel.")
-        print("              - Generates 'sighting_log.csv' and 'youtube_chapters.txt'.\n")
+        print("  analyze   : Identifies species using Google Gemini.")
+        print(
+            "              - Smart Retry: Re-scans video if confidence < 60% or scientific name unknown."
+        )
+        print("              - Smart Filter: Ignores rocks/sand/gravel/humans.")
+        print(
+            "              - Generates 'sighting_log_{video}.csv' and 'youtube_chapters.txt'.\n"
+        )
 
-        print("  refine    : (Manual Only) specialized command to re-scan just the manual folder.")
+        print(
+            "  refine    : (Manual Only) specialized command to re-scan just the manual folder."
+        )
         print("              - Note: 'tune' runs this automatically.\n")
 
         print("Configuration:")

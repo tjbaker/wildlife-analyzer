@@ -1,19 +1,35 @@
 .DS_Store
-  
-# Configuration
+
+# IDE
+.vscode/
+.idea/
+
+# Configuration — config.sample.py is safe to commit; everything else contains secrets
 config.py
+config_*.py
+
+# Claude Code session data
+.claude/
 
 # Environment
 venv/
 __pycache__/
 *.pyc
 
+# Video files
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
+*.mkv
+*.MKV
+
 # Outputs
 extracted_images/
 *.bak.*
 *.csv
 *.log
-*.mp4
-*.MP4
 notes.txt
 youtube_chapters.txt
