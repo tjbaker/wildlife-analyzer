@@ -82,6 +82,9 @@ class CONFIG:
     SMART_RETRY = True
     RETRY_CONFIDENCE_THRESHOLD = 0.60
 
+    # Consensus Pass
+    CONSENSUS_WINDOW = 5  # seconds; 0 = disabled
+
     # Inanimate Filter
     INANIMATE_OBJECTS = [
         "none",
@@ -194,6 +197,9 @@ class CONFIG:
                 user_config, "ANTHROPIC_API_KEY", cls.ANTHROPIC_API_KEY
             )
             cls.SESSION_TAG = getattr(user_config, "SESSION_TAG", cls.SESSION_TAG)
+            cls.CONSENSUS_WINDOW = getattr(
+                user_config, "CONSENSUS_WINDOW", cls.CONSENSUS_WINDOW
+            )
 
             # Load API keys if present
             api_key = getattr(user_config, "GOOGLE_API_KEY", None)
@@ -556,6 +562,7 @@ def extract_frames():
     pbar = tqdm(total=total_frames, unit="frames")
 
     current_frame = 0
+    _score_pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
     while True:
         if current_frame >= total_frames:
@@ -609,17 +616,18 @@ def extract_frames():
                 # Reset to start of interval (since we read one frame)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
 
+                interval_frames = []
                 for _ in range(frames_to_read):
                     ret, frame = cap.read()
                     if not ret:
                         break
+                    interval_frames.append(frame)
 
-                    # We need to score it to find the best
-                    _, b_score = is_blurry(frame)
-
-                    if b_score > best_blur_score:
-                        best_blur_score = b_score
-                        final_frame = frame
+                if interval_frames:
+                    scores = list(_score_pool.map(lambda f: is_blurry(f)[1], interval_frames))
+                    best_idx = max(range(len(scores)), key=lambda i: scores[i])
+                    best_blur_score = scores[best_idx]
+                    final_frame = interval_frames[best_idx]
 
                 # Advance counter
                 current_frame += frames_to_read
@@ -718,6 +726,7 @@ def extract_frames():
 
     pbar.close()
     cap.release()
+    _score_pool.shutdown(wait=False)
 
     estimated_cost = saved_count * CONFIG.COST_PER_IMAGE
 
@@ -890,6 +899,208 @@ def get_video_creation_date(video_path):
         logging.warning(f"Warning: Could not extract video date: {e}")
 
     return None
+
+
+def _ts_to_sec(ts):
+    parts = ts.strip().split(":")
+    try:
+        return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        return 0
+
+
+def _extract_type_word(common_names):
+    """Return the most-shared meaningful word across a list of common names."""
+    stop = {"the", "a", "an", "of", "and", "or", "with", "de", "la",
+            "long", "short", "big", "small"}
+    counts = {}
+    for name in common_names:
+        for word in name.lower().split():
+            if len(word) > 3 and word not in stop:
+                counts[word] = counts.get(word, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def run_consensus_pass(client, log_file):
+    """Re-analyze tight clusters of same-type frames with inconsistent IDs.
+
+    Uses common-name keyword overlap to identify which frames in a cluster show
+    the same animal, then sends only those frames to the API — bystander frames
+    (e.g. a Frogfish that happens to appear between eel frames) are left untouched.
+    """
+    try:
+        with open(log_file, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return
+
+    if not rows:
+        return
+
+    _UNKNOWN_SCI = {"unknown", "null", "none", ""}
+
+    # Group rows by file
+    frame_species: dict = {}
+    for row in rows:
+        frame_species.setdefault(row["file"], []).append(row)
+
+    # Only consider single-species frames (skip complex multi-species scenes)
+    single_frames = {f for f, species in frame_species.items() if len(species) == 1}
+
+    unique_frames = sorted(
+        single_frames,
+        key=lambda f: _ts_to_sec(frame_species[f][0]["timestamp"])
+    )
+
+    if not unique_frames:
+        return
+
+    # Build tight sub-clusters: allow one skipped interval between consecutive frames
+    max_gap = CONFIG.SNAPSHOT_INTERVAL + 1
+    sub_clusters: list[list[str]] = []
+    current: list[str] = [unique_frames[0]]
+    for fname in unique_frames[1:]:
+        prev_sec = _ts_to_sec(frame_species[current[-1]][0]["timestamp"])
+        this_sec = _ts_to_sec(frame_species[fname][0]["timestamp"])
+        if this_sec - prev_sec <= max_gap:
+            current.append(fname)
+        else:
+            sub_clusters.append(current)
+            current = [fname]
+    sub_clusters.append(current)
+
+    # Split sub-clusters by CONSENSUS_WINDOW
+    windowed_clusters: list[list[str]] = []
+    for sc in sub_clusters:
+        current = [sc[0]]
+        for fname in sc[1:]:
+            start_sec = _ts_to_sec(frame_species[current[0]][0]["timestamp"])
+            this_sec = _ts_to_sec(frame_species[fname][0]["timestamp"])
+            if this_sec - start_sec <= CONFIG.CONSENSUS_WINDOW:
+                current.append(fname)
+            else:
+                windowed_clusters.append(current)
+                current = [fname]
+        windowed_clusters.append(current)
+
+    updated_count = 0
+
+    for cluster_files in windowed_clusters:
+        if len(cluster_files) < 2:
+            continue
+
+        # Find which genus appears most (≥2 times)
+        genus_to_files: dict = {}
+        for f in cluster_files:
+            sci = frame_species[f][0].get("scientific_name", "").strip()
+            if sci.lower() in _UNKNOWN_SCI or not sci.split():
+                continue
+            genus = sci.split()[0].lower()
+            genus_to_files.setdefault(genus, []).append(f)
+
+        repeated = {g: files for g, files in genus_to_files.items() if len(files) >= 2}
+        if not repeated:
+            continue
+
+        # Use the most-repeated genus as the anchor
+        anchor_genus = max(repeated, key=lambda g: len(repeated[g]))
+        anchor_files = repeated[anchor_genus]
+
+        # Extract the type word from the anchor frames' common names
+        anchor_names = [frame_species[f][0]["common_name"] for f in anchor_files]
+        type_word = _extract_type_word(anchor_names)
+
+        # Build send list: anchor frames + other cluster frames sharing the type word
+        if type_word:
+            send_files = [
+                f for f in cluster_files
+                if type_word in frame_species[f][0].get("common_name", "").lower()
+            ]
+        else:
+            send_files = anchor_files  # fallback
+
+        if len(send_files) < 2:
+            continue
+
+        # Check if there's actually any inconsistency in send_files
+        sci_names = {
+            frame_species[f][0]["scientific_name"].strip().lower()
+            for f in send_files
+            if frame_species[f][0].get("scientific_name", "").strip().lower() not in _UNKNOWN_SCI
+        }
+        if len(sci_names) <= 1:
+            continue
+
+        # Load images for the send list
+        images = []
+        for fname in send_files:
+            for d in (CONFIG.FRAMES_DIR, CONFIG.MANUAL_DIR):
+                p = os.path.join(d, fname)
+                if os.path.exists(p):
+                    try:
+                        images.append(PIL.Image.open(p))
+                    except Exception:
+                        pass
+                    break
+
+        if not images:
+            continue
+
+        ts_range = (f"{frame_species[send_files[0]][0]['timestamp']}–"
+                    f"{frame_species[send_files[-1]][0]['timestamp']}")
+        names = ", ".join(frame_species[f][0]["common_name"] for f in send_files)
+        subject = f"the same {type_word}" if type_word else "the same subject"
+        logging.info(f"  > Consensus [{ts_range}] ({subject}): {names}")
+
+        consensus_prompt = (
+            f"You are a field biologist. Location: {CONFIG.LOCATION_CONTEXT}. "
+            f"These images are sequential frames of {subject} filmed seconds apart. "
+            f"Previous analysis gave inconsistent IDs: {names}. "
+            "Use all frames together to determine the single best identification. "
+            "Return ONLY valid JSON with no markdown — a single object: "
+            '{{"common_name": "string or null", "scientific_name": "string or null", '
+            '"confidence": 0.0-1.0, "notes": "brief observation"}}'
+        )
+
+        try:
+            text = call_ai_api(client, consensus_prompt, *images)
+            result = parse_ai_response(text)
+            if not result:
+                continue
+            item = result[0]
+            name = (item.get("common_name") or "").strip()
+            sci = (item.get("scientific_name") or "").strip()
+            conf = float(item.get("confidence") or 0.0)
+            if not name or sci.lower() in _UNKNOWN_SCI:
+                logging.info("  > Consensus: no valid ID, keeping originals.")
+                continue
+            logging.info(f"  > Consensus result: {name} ({sci}) [{conf:.2f}]")
+            for fname in send_files:
+                for row in frame_species[fname]:
+                    row["common_name"] = name
+                    row["scientific_name"] = sci
+                    row["confidence"] = f"{conf:.2f}"
+            updated_count += len(send_files)
+        except Exception as e:
+            logging.warning(f"  > Consensus call failed: {e}")
+
+    if updated_count == 0:
+        return
+
+    # Rewrite CSV preserving all rows (bystanders unchanged)
+    fieldnames = ["timestamp", "file", "common_name", "scientific_name", "confidence"]
+    all_unique = sorted(
+        frame_species.keys(),
+        key=lambda f: _ts_to_sec(frame_species[f][0]["timestamp"])
+    )
+    with open(log_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        writer.writeheader()
+        for fname in all_unique:
+            writer.writerows(frame_species[fname])
+    logging.info(f"Consensus pass complete: updated {updated_count} frames.")
 
 
 def sort_session_log(log_path):
@@ -1145,6 +1356,10 @@ def analyze_frames():
                         (result["timestamp"], entry, result["confidence"])
                     )
 
+    if CONFIG.CONSENSUS_WINDOW > 0:
+        logging.info("--- Consensus Pass ---")
+        run_consensus_pass(client, log_file)
+
     # Regenerate chapters from the full CSV so resumes produce a complete file.
     # Normalize common names: for each scientific name, use whichever common name
     # appears most frequently (ties broken by highest confidence).
@@ -1194,6 +1409,7 @@ def analyze_frames():
         logging.info("Saved youtube_chapters.txt")
 
     sort_session_log(log_file)
+
 
 
 def get_scores(directory):

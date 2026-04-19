@@ -13,6 +13,7 @@ Built with **Python**, **OpenCV**, and **Google Gemini** or **Anthropic Claude**
 - **Auto-Tuning** — calibrates blur/content thresholds from your manual sorting feedback
 - **Inanimate Filtering** — ignores rocks, sand, water, and generic "fish" to keep logs clean
 - **Master Log** — consolidates sessions into `master_sighting_log.csv` with location and date metadata
+- **Consensus Pass** — after analysis, re-queries the API with groups of consecutive frames that have conflicting IDs for the same animal type, producing a single consistent identification
 - **YouTube Chapters** — generates timestamped species list ready to paste into video descriptions
 
 ## Setup
@@ -65,13 +66,18 @@ python wildlife_analyzer.py extract
 Scans the video and saves sharp, interesting frames to `extracted_images/good/`.
 
 ### 2. Curate *(recommended)*
-Manually review `extracted_images/good/` in Finder. Move unwanted frames (empty water, rocks, bad angles) to `rejected/`. Promoting good frames from `blurry/` or `rejected/` back to `good/` is also supported. This step has the single biggest impact on result quality.
+After extraction, `good/` contains frames that passed the automated filters, and `blurry/` / `rejected/` contain the ones that didn't. Manually review `good/` in Finder and remove frames you don't want analyzed (empty water, rocks, bad angles). You can also promote frames from `blurry/` or `rejected/` back to `good/` if they contain something useful.
+
+**One clean frame per continuous sighting is enough.** The YouTube chapters builder only writes a new entry when a species *reappears* after being absent — 20 consecutive frames of the same animal produce exactly one chapter line. Pruning redundant frames before `analyze` reduces API cost with no loss of output quality.
+
+This step has the single biggest impact on result quality.
 
 ### 3. Tune *(optional)*
 If you've done significant manual sorting, run the tuner to recalibrate thresholds for your video conditions:
 ```bash
 python wildlife_analyzer.py tune
 ```
+The tuner reads score distributions across `good/`, `blurry/`, and `rejected/` — don't delete frames from those folders before running it, as that skews the calibration.
 
 ### 4. Refine *(optional)*
 Move any "almost good" frames to `extracted_images/manual/`, then:
@@ -112,9 +118,10 @@ Enriches the session log with date (from video metadata) and location, then appe
 | `SMART_RETRY` | Re-query with a better frame when confidence is low | `True` |
 | `BLUR_THRESHOLD` | Laplacian variance cutoff (auto-tuned) | `100.0` |
 | `MIN_CONTENT_THRESHOLD` | Edge density cutoff (auto-tuned) | `0.005` |
-| `CONFIDENCE_THRESHOLD` | Minimum confidence to include in YouTube chapters | `0.70` |
+| `CONFIDENCE_THRESHOLD` | Minimum confidence to include in YouTube chapters | `0.80` |
 | `RETRY_CONFIDENCE_THRESHOLD` | Confidence below which Smart Retry fires | `0.60` |
 | `CONTEXT_FRAMES` | Frames sent per AI call (3 = temporal context, 1 = faster) | `3` |
+| `CONSENSUS_WINDOW` | Seconds window for post-analysis consensus pass; groups consecutive same-type frames with conflicting IDs and re-queries with all frames together; `0` = disabled | `5` |
 
 ### Custom Prompts
 
